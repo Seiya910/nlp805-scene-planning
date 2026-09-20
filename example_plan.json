@@ -1,0 +1,18 @@
+{
+  "prompt": "A red cup to the left of a blue plate.",
+  "objects": [
+    {
+      "id": "cup",
+      "description": "a red cup",
+      "bbox": [0.1, 0.35, 0.35, 0.65]
+    },
+    {
+      "id": "plate",
+      "description": "a blue plate",
+      "bbox": [0.6, 0.35, 0.9, 0.65]
+    }
+  ],
+  "relations": [
+    {"subject": "cup", "relation": "left_of", "object": "plate"}
+  ]
+}
