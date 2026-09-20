@@ -5,7 +5,7 @@ NLP805 course project by Jinjie Wei.
 The project asks whether a scene plan and a consistency-checking step help a text-to-image model follow spatial relations. The pilot compares **direct prompting**, **unchecked planning**, and **checked planning**, using the same image generator and diffusion seeds.
 
 - [Overleaf proposal](https://www.overleaf.com/project/6aa3a4cd48d9c33c0f86d534)
-- [Presentation slides](Scene_generation_Jinjie_Wei_real_failure.pptx)
+- [Presentation slides](proposal_JinjieWei.pptx)
 
 ## Current status
 
