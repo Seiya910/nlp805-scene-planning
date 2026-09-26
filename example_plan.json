@@ -1,5 +1,6 @@
 {
   "prompt": "A red cup to the left of a blue plate.",
+  "coordinate_system": "normalized [0, 1], origin at the top left",
   "objects": [
     {
       "id": "cup",
