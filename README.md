@@ -8,7 +8,7 @@ For the first experiment, I plan to compare the original prompt, a prompt produc
 
 ## Files
 
-- `proposal_JinjieWei.pptx`: First project presentation
+- `presentations/proposal_JinjieWei.pptx`: First project presentation
 - `example_plan.json`: a small scene-plan example
 - `scene_plan.py`: basic checks for objects, boxes, and relations
 - `split_prompts.py`: split prompts into development and evaluation sets
