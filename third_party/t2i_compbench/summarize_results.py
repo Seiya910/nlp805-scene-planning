@@ -81,6 +81,22 @@ def prompt_means(records):
     return means
 
 
+def check_paired_seeds(records):
+    seeds = defaultdict(lambda: defaultdict(set))
+    for record in records:
+        seeds[str(record["prompt_id"])][record["condition"]].add(record["seed"])
+
+    for prompt_id, by_condition in seeds.items():
+        direct = by_condition.get("direct")
+        if direct is None:
+            continue
+        for condition in CONDITIONS[1:]:
+            if condition in by_condition and by_condition[condition] != direct:
+                raise ValueError(
+                    f"prompt {prompt_id}: {condition} and direct must use the same seeds"
+                )
+
+
 def percentile(values, fraction):
     ordered = sorted(values)
     if not ordered:
@@ -104,6 +120,7 @@ def bootstrap_ci(differences, rounds, seed):
 
 
 def summarize(records, rounds=2000, seed=42):
+    check_paired_seeds(records)
     means = prompt_means(records)
     summary = {}
     for condition in CONDITIONS:
