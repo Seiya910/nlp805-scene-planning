@@ -1,27 +1,54 @@
 import json
+import math
 import sys
 
 
 def check_plan(plan):
+    if not isinstance(plan, dict):
+        return ["Plan must be a JSON object."]
+
     errors = []
     objects = plan.get("objects", [])
     relations = plan.get("relations", [])
+
+    if not isinstance(objects, list):
+        errors.append("Objects must be a list.")
+        objects = []
+    if not isinstance(relations, list):
+        errors.append("Relations must be a list.")
+        relations = []
 
     if len(objects) < 2:
         errors.append("The plan needs at least two objects.")
 
     ids = set()
     centers = {}
-    for obj in objects:
+    for index, obj in enumerate(objects, 1):
+        if not isinstance(obj, dict):
+            errors.append(f"Object {index} must be a JSON object.")
+            continue
         name = obj.get("id")
         box = obj.get("bbox", [])
 
-        if not name or name in ids:
-            errors.append("Object IDs must be unique.")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"Object {index} needs an ID.")
+            continue
+        if name in ids:
+            errors.append("Object IDs must be unique: " + name)
             continue
         ids.add(name)
 
-        if len(box) != 4 or not all(isinstance(x, (int, float)) for x in box):
+        if (
+            not isinstance(box, (list, tuple))
+            or len(box) != 4
+            or not all(
+                isinstance(x, (int, float))
+                and not isinstance(x, bool)
+                and 0 <= x <= 1
+                and math.isfinite(x)
+                for x in box
+            )
+        ):
             errors.append("Invalid box for " + name)
             continue
 
@@ -32,7 +59,10 @@ def check_plan(plan):
 
         centers[name] = ((x0 + x1) / 2, (y0 + y1) / 2)
 
-    for relation in relations:
+    for index, relation in enumerate(relations, 1):
+        if not isinstance(relation, dict):
+            errors.append(f"Relation {index} must be a JSON object.")
+            continue
         first = relation.get("subject")
         second = relation.get("object")
         kind = relation.get("relation")
