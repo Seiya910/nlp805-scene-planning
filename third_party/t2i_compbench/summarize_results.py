@@ -8,6 +8,7 @@ particular upstream output filename or copy the benchmark implementation.
 
 import argparse
 import json
+import math
 import random
 import statistics
 from collections import defaultdict
@@ -19,6 +20,7 @@ CONDITIONS = ("direct", "unchecked_plan", "checked_plan")
 
 def read_records(path):
     records = []
+    seen = set()
     for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -26,6 +28,8 @@ def read_records(path):
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(f"line {line_number}: invalid JSON ({exc.msg})") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"line {line_number}: expected a JSON object")
 
         required = {"prompt_id", "condition", "seed", "spatial_score", "both_objects_detected"}
         missing = required - record.keys()
@@ -33,13 +37,28 @@ def read_records(path):
             raise ValueError(f"line {line_number}: missing {', '.join(sorted(missing))}")
         if record["condition"] not in CONDITIONS:
             raise ValueError(f"line {line_number}: unknown condition {record['condition']!r}")
-        if not isinstance(record["seed"], int):
+        if (
+            not isinstance(record["prompt_id"], (str, int))
+            or isinstance(record["prompt_id"], bool)
+            or not str(record["prompt_id"]).strip()
+        ):
+            raise ValueError(f"line {line_number}: prompt_id must be a nonempty string or integer")
+        if not isinstance(record["seed"], int) or isinstance(record["seed"], bool):
             raise ValueError(f"line {line_number}: seed must be an integer")
         score = record["spatial_score"]
-        if not isinstance(score, (int, float)) or not 0 <= score <= 1:
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not 0 <= score <= 1
+            or not math.isfinite(score)
+        ):
             raise ValueError(f"line {line_number}: spatial_score must be between 0 and 1")
         if not isinstance(record["both_objects_detected"], bool):
             raise ValueError(f"line {line_number}: both_objects_detected must be boolean")
+        key = (str(record["prompt_id"]), record["condition"], record["seed"])
+        if key in seen:
+            raise ValueError(f"line {line_number}: duplicate prompt, condition, and seed")
+        seen.add(key)
         records.append(record)
 
     if not records:
