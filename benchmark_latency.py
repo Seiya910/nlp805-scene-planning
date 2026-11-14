@@ -1,285 +1,275 @@
-"""Measure per-image inference latency without including model loading or warmup.
+"""原文四个 backbone 的 warm latency；不重写 MCP/HCD 算法。
 
-The built-in runner measures direct generation. To measure ScenePlan, pass a
-``module:factory`` with --runner. The factory receives model_id, revision,
-device, and dtype, and returns an object with generate(prompt, seed, steps,
-guidance_scale, width, height, timer). The object is loaded once. Inside
-generate(), wrap real work in ``with timer.stage("mcp")`` and
-``with timer.stage("hcd")``; wrap each agent request in
-``with timer.agent("agent_name")``. Stage times are inclusive, so an agent
-stage inside MCP must not be added to MCP time again.
+自定义 --runner module:factory 需返回 generate(prompt, seed, timer) 的对象，
+并提供 metadata['scheduler']。真实 agent 请求用 timer.agent(name) 包住，
+MCP/HCD 分别用 timer.stage('mcp') / timer.stage('hcd', gpu=True)。
 """
-
 import argparse
+import hashlib
 import importlib
 import importlib.metadata
 import json
-import math
 import platform
+import subprocess
+import threading
 import time
+import uuid
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-
-# SD2 repositories below are currently accessible community mirrors. Override
-# --model-id if the original experiment used a different checkpoint/revision.
-MODEL_IDS = {
-    "sd15": "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    "sd20-base": "sd2-community/stable-diffusion-2-base",
-    "sd20": "sd2-community/stable-diffusion-2",
-    "sdxl-base": "stabilityai/stable-diffusion-xl-base-1.0",
+PIPELINES = {
+    "sd15": "StableDiffusionPipeline",
+    "sd20-base": "StableDiffusionPipeline",
+    "sd20": "StableDiffusionPipeline",
+    "sdxl-base": "StableDiffusionXLPipeline",
 }
-DEFAULT_SIZE = {"sd15": 512, "sd20-base": 512, "sd20": 768, "sdxl-base": 1024}
 
 
-def package_version(name):
-    try:
-        return importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        return None
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def checkpoint_hash(path):
+    # 只做一次文件摘要，放在计时之前，避免同一路径换权重后误配对。
+    result = hashlib.sha256()
+    for file in sorted(Path(path).rglob("*")):
+        if file.is_file() and file.suffix in (".json", ".safetensors", ".bin", ".txt") and ".cache" not in file.parts:
+            result.update(str(file.relative_to(path)).encode())
+            with file.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                    result.update(chunk)
+    return result.hexdigest()
 
 
 def read_prompts(path):
-    path = Path(path)
-    if path.suffix == ".json":
-        rows = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(rows, list):
-            raise ValueError("JSON prompts must be a list")
-    elif path.suffix == ".jsonl":
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    text = Path(path).read_text(encoding="utf-8")
+    if Path(path).suffix == ".json":
+        rows = json.loads(text)
+    elif Path(path).suffix == ".jsonl":
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     else:
-        rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-    prompts = []
-    seen = set()
-    for index, row in enumerate(rows, 1):
-        if isinstance(row, str):
-            prompt_id, prompt = f"p{index:04d}", row.strip()
-        elif isinstance(row, dict):
-            prompt_id, prompt = row.get("prompt_id"), row.get("prompt")
-        else:
-            raise ValueError(f"prompt {index} must be text or an object")
-        if not isinstance(prompt_id, str) or not prompt_id.strip():
-            raise ValueError(f"prompt {index} needs a nonempty prompt_id")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError(f"prompt {index} needs nonempty text")
-        if prompt_id in seen:
-            raise ValueError(f"duplicate prompt_id: {prompt_id}")
-        seen.add(prompt_id)
-        prompts.append((prompt_id, prompt))
-    if not prompts:
-        raise ValueError("no prompts found")
-    return prompts
-
-
-class DeviceClock:
-    def __init__(self, device):
-        self.device = device
-        try:
-            import torch
-        except ImportError:
-            torch = None
-        self.torch = torch
-        if device.startswith("cuda") and (torch is None or not torch.cuda.is_available()):
-            raise RuntimeError("CUDA is unavailable; run on the experiment GPU or use --device cpu for a smoke test")
-
-    def sync(self):
-        if self.torch is None:
-            return
-        if self.device.startswith("cuda"):
-            self.torch.cuda.synchronize(self.device)
-        elif self.device == "mps" and hasattr(self.torch.mps, "synchronize"):
-            self.torch.mps.synchronize()
-
-    def hardware(self):
-        if self.torch is not None and self.device.startswith("cuda"):
-            return self.torch.cuda.get_device_name(self.device)
-        return platform.processor() or platform.machine()
-
-    def reset_peak(self):
-        if self.torch is None or not self.device.startswith("cuda"):
-            return None
-        self.sync()
-        baseline = self.torch.cuda.memory_allocated(self.device) / (1024 ** 2)
-        self.torch.cuda.reset_peak_memory_stats(self.device)
-        return baseline
-
-    def peak(self):
-        if self.torch is None or not self.device.startswith("cuda"):
-            return None, None
-        self.sync()
-        return (
-            self.torch.cuda.max_memory_allocated(self.device) / (1024 ** 2),
-            self.torch.cuda.max_memory_reserved(self.device) / (1024 ** 2),
-        )
+        rows = [line.strip() for line in text.splitlines() if line.strip()]
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("prompt file must contain a nonempty list")
+    result, ids = [], set()
+    for i, row in enumerate(rows, 1):
+        row = {"prompt_id": f"p{i:04d}", "prompt": row} if isinstance(row, str) else row
+        if not isinstance(row, dict) or not isinstance(row.get("prompt"), str) or not row["prompt"].strip():
+            raise ValueError(f"invalid prompt at row {i}")
+        prompt_id = str(row.get("prompt_id", f"p{i:04d}"))
+        if not prompt_id.strip() or prompt_id in ids:
+            raise ValueError(f"empty or duplicate prompt_id: {prompt_id}")
+        ids.add(prompt_id)
+        result.append((prompt_id, row["prompt"]))
+    return result
 
 
 class Timer:
-    def __init__(self, clock):
-        self.clock = clock
-        self.stage_seconds = defaultdict(float)
-        self.agent_calls = Counter()
+    def __init__(self, sync):
+        self.sync = sync
+        self.seconds = defaultdict(float)
+        self.calls = Counter()
+        self.lock = threading.Lock()
 
     @contextmanager
-    def stage(self, name):
-        if not isinstance(name, str) or not name:
-            raise ValueError("stage name must be nonempty")
-        self.clock.sync()
+    def stage(self, name, gpu=False):
+        # API/CPU 阶段不做 CUDA sync，避免改变并行 agent 的执行方式。
+        if gpu:
+            self.sync()
         start = time.perf_counter()
         try:
             yield
         finally:
-            self.clock.sync()
-            self.stage_seconds[name] += time.perf_counter() - start
+            if gpu:
+                self.sync()
+            with self.lock:
+                self.seconds[name] += time.perf_counter() - start
 
     @contextmanager
     def agent(self, name):
-        self.agent_calls[name] += 1
-        with self.stage(f"agent:{name}"):
+        # 每次实际请求记一次；若有 retry，需要在每次请求处分别计数。
+        with self.lock:
+            self.calls[name] += 1
+        with self.stage("agent:" + name):
             yield
 
 
-class DiffusersRunner:
-    def __init__(self, model_id, revision, device, dtype):
-        try:
-            import torch
-            from diffusers import DiffusionPipeline
-        except ImportError as exc:
-            raise RuntimeError("direct generation needs torch and diffusers") from exc
-        torch_dtype = getattr(torch, dtype)
-        options = {"torch_dtype": torch_dtype}
+class DirectRunner:
+    def __init__(self, model, checkpoint, revision, settings):
+        import diffusers
+        import torch
+        options = {"torch_dtype": getattr(torch, settings["dtype"])}
         if revision:
             options["revision"] = revision
-        self.pipeline = DiffusionPipeline.from_pretrained(model_id, **options).to(device)
-        self.pipeline.set_progress_bar_config(disable=True)
-        self.torch = torch
-        self.device = device
+        cls = getattr(diffusers, PIPELINES[model])
+        self.pipe = cls.from_pretrained(checkpoint, **options).to("cuda:0")
+        self.pipe.set_progress_bar_config(disable=True)
+        self.settings = settings
+        # 保留 checkpoint 自带 scheduler，不擅自换成 DDIM/Euler。
+        self.metadata = {"scheduler": {"class": type(self.pipe.scheduler).__name__,
+                                      "config": dict(self.pipe.scheduler.config)},
+                         "pipeline": type(self.pipe).__name__,
+                         "safety_checker": getattr(self.pipe, "safety_checker", None) is not None}
 
-    def generate(self, prompt, seed, steps, guidance_scale, width, height, timer):
-        generator = self.torch.Generator(device=self.device).manual_seed(seed)
-        with self.torch.inference_mode(), timer.stage("diffusion"):
-            result = self.pipeline(
-                prompt=prompt,
-                generator=generator,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                width=width,
-                height=height,
-            )
-            _ = result.images[0]  # Include image decoding, but not disk writing.
-
-
-def load_runner(spec, model_id, revision, device, dtype):
-    if spec == "diffusers":
-        return DiffusersRunner(model_id, revision, device, dtype)
-    if ":" not in spec:
-        raise ValueError("--runner must be 'diffusers' or module:factory")
-    module_name, factory_name = spec.split(":", 1)
-    factory = getattr(importlib.import_module(module_name), factory_name)
-    return factory(model_id=model_id, revision=revision, device=device, dtype=dtype)
+    def generate(self, prompt, seed, timer):
+        import torch
+        s = self.settings
+        with torch.inference_mode(), timer.stage("generation", gpu=True):
+            generator = torch.Generator(device="cuda:0").manual_seed(seed)
+            self.pipe(prompt, generator=generator, width=s["width"], height=s["height"],
+                      num_inference_steps=s["steps"], guidance_scale=s["guidance_scale"],
+                      negative_prompt=s["negative_prompt"], num_images_per_prompt=1,
+                      output_type="pil")  # 包含 VAE decode，不包含保存图片。
 
 
-def measure(runner, clock, prompt, seed, settings):
-    timer = Timer(clock)
-    baseline = clock.reset_peak()
-    clock.sync()
-    start = time.perf_counter()
-    runner.generate(prompt, seed, settings["steps"], settings["guidance_scale"],
-                    settings["width"], settings["height"], timer)
-    clock.sync()
-    elapsed = time.perf_counter() - start
-    peak_allocated, peak_reserved = clock.peak()
-    return {
-        "latency_s": elapsed,
-        "stage_seconds": dict(timer.stage_seconds),
-        "agent_calls": dict(timer.agent_calls),
-        "gpu_baseline_allocated_mib": baseline,
-        "gpu_peak_allocated_mib": peak_allocated,
-        "gpu_peak_reserved_mib": peak_reserved,
-    }
+def environment(torch):
+    packages = {}
+    for name in ("torch", "torchvision", "diffusers", "transformers", "accelerate",
+                 "safetensors", "huggingface-hub", "numpy", "Pillow"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    try:
+        driver = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        driver = "unknown"
+    return {"python": platform.python_version(), "os": platform.platform(),
+            "gpu": torch.cuda.get_device_name(0), "cuda_runtime": torch.version.cuda,
+            "driver": driver, "packages": packages}
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompts", type=Path, required=True, help="data/eval.json, JSONL, or one prompt per line")
-    parser.add_argument("--model", choices=MODEL_IDS, required=True)
-    parser.add_argument("--model-id", help="override the checkpoint for this model label")
-    parser.add_argument("--revision", help="optional fixed Hugging Face revision")
-    parser.add_argument("--condition", choices=("direct", "sceneplan"), required=True)
-    parser.add_argument("--runner", default="diffusers", help="diffusers or module:factory")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--guidance-scale", type=float, default=7.0)
-    parser.add_argument("--width", type=int)
-    parser.add_argument("--height", type=int)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3])
-    parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--limit", type=int, help="use only the first N prompts")
-    parser.add_argument("--output", type=Path, default=Path("runs/latency.jsonl"))
-    parser.add_argument("--append", action="store_true", help="append another model or condition")
-    args = parser.parse_args()
-    if args.condition == "sceneplan" and args.runner == "diffusers":
-        parser.error("ScenePlan needs a real MCP/HCD --runner; direct Diffusers is not ScenePlan")
-    if args.steps < 1 or args.repeats < 1 or args.warmup < 0 or (args.limit is not None and args.limit < 1):
-        parser.error("steps/repeats/limit must be positive and warmup must be nonnegative")
-    if not math.isfinite(args.guidance_scale) or args.guidance_scale < 0:
-        parser.error("guidance scale must be finite and nonnegative")
-    if not args.seeds or any(seed < 0 for seed in args.seeds) or len(set(args.seeds)) != len(args.seeds):
-        parser.error("seeds must be distinct nonnegative integers")
-    width = args.width if args.width is not None else DEFAULT_SIZE[args.model]
-    height = args.height if args.height is not None else DEFAULT_SIZE[args.model]
-    if width < 8 or height < 8 or width % 8 or height % 8:
-        parser.error("width and height must be positive multiples of 8")
-    if args.output.exists() and not args.append:
-        parser.error(f"output exists: {args.output}; use --append or choose another file")
-
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--prompts", required=True)
+    p.add_argument("--model", choices=PIPELINES, required=True)
+    p.add_argument("--condition", choices=("direct", "sceneplan"), default="direct")
+    p.add_argument("--config", default="latency_settings.json")
+    p.add_argument("--checkpoint", help="原实验的本地 Diffusers checkpoint，或固定 revision 的 Hub repo")
+    p.add_argument("--revision", help="Hub checkpoint 必须给出 40 位 commit SHA")
+    p.add_argument("--runner", help="真实推理适配器 module:factory；不提供时只支持 direct")
+    p.add_argument("--limit", type=int, help="只跑前 N 条，便于 smoke test")
+    p.add_argument("--allow-other-gpu", action="store_true", help="测试其他 GPU，结果会记录实际型号")
+    p.add_argument("--output")
+    args = p.parse_args()
+    if args.condition == "sceneplan" and not args.runner:
+        p.error("ScenePlan needs the real MCP/HCD --runner; it is not implemented in this repository")
+    if args.runner and ":" not in args.runner:
+        p.error("runner must be module:factory")
+    if args.limit is not None and args.limit < 1:
+        p.error("limit must be positive")
+    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    s, timing = config["generation"], config["timing"]
+    if s["steps"] != 20 or s["guidance_scale"] != 7.0:
+        p.error("paper setting: 20 steps and CFG 7.0")
+    if s["batch_size"] != 1 or s["scheduler"] != "checkpoint" or s["plan_cache"] is not False:
+        p.error("this protocol uses batch=1, checkpoint scheduler and uncached plans")
+    if any(type(s[k]) is not int or s[k] < 8 or s[k] % 8 for k in ("width", "height")):
+        p.error("width/height must be positive multiples of 8")
+    if s["dtype"] not in ("float16", "bfloat16", "float32"):
+        p.error("invalid dtype")
+    seeds = timing["seeds"]
+    if (not seeds or any(type(x) is not int or x < 0 for x in seeds)
+            or len(seeds) != len(set(seeds))):
+        p.error("seeds must be unique nonnegative integers")
+    if type(timing["warmup"]) is not int or timing["warmup"] < 0 or type(timing["repeats"]) is not int or timing["repeats"] < 1:
+        p.error("invalid warmup/repeats")
+    model_config = config["checkpoints"][args.model]
+    checkpoint = args.checkpoint or model_config["path_or_repo"]
+    revision = args.revision or model_config["revision"]
+    if not checkpoint:
+        p.error("set --checkpoint to the original model; no automatic community-mirror substitution")
+    if Path(checkpoint).is_dir():
+        checkpoint = str(Path(checkpoint).resolve())
+        if not (Path(checkpoint) / "model_index.json").is_file():
+            p.error("local checkpoint needs Diffusers model_index.json")
+        checkpoint_identity = checkpoint_hash(checkpoint)
+    elif not revision or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
+        p.error("Hub checkpoints need an immutable 40-character --revision")
+    else:
+        checkpoint_identity = checkpoint + "@" + revision
+    output = Path(args.output or f"runs/latency_{args.model}_{args.condition}.jsonl")
+    if output.exists():
+        p.error(f"output already exists: {output}; choose a new file")
     prompts = read_prompts(args.prompts)
     if args.limit:
         prompts = prompts[:args.limit]
-    model_id = args.model_id or MODEL_IDS[args.model]
-    settings = {"steps": args.steps, "guidance_scale": args.guidance_scale,
-                "width": width, "height": height}
-    clock = DeviceClock(args.device)
-    clock.sync()
-    load_start = time.perf_counter()
-    runner = load_runner(args.runner, model_id, args.revision, args.device, args.dtype)
-    clock.sync()
-    load_s = time.perf_counter() - load_start
-    for _ in range(args.warmup):
-        measure(runner, clock, prompts[0][1], args.seeds[0], settings)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("a" if args.append else "x", encoding="utf-8") as stream:
+    import torch
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        p.error("use one visible CUDA GPU, e.g. CUDA_VISIBLE_DEVICES=0")
+    env = environment(torch)
+    if "A800" not in env["gpu"] and not args.allow_other_gpu:
+        p.error("paper uses A800; --allow-other-gpu labels a different-hardware test")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    sync = lambda: torch.cuda.synchronize(0)
+    sync()
+    start = time.perf_counter()
+    factory = DirectRunner
+    runner_entry = Path(__file__)
+    if args.runner:
+        module, name = args.runner.split(":", 1)
+        module = importlib.import_module(module)
+        factory = getattr(module, name)
+        runner_entry = Path(module.__file__)
+    runner = factory(model=args.model, checkpoint=checkpoint, revision=revision, settings=s)
+    sync()
+    load_s = time.perf_counter() - start
+    if not isinstance(getattr(runner, "metadata", None), dict) or "scheduler" not in runner.metadata:
+        p.error("runner.metadata must include the actual scheduler class/config")
+    if args.condition == "sceneplan":
+        mcp_model = runner.metadata.get("mcp_model", "")
+        if not (mcp_model == "gpt-4o-mini" or mcp_model.startswith("gpt-4o-mini-")):
+            p.error("real runner.metadata must identify the actual GPT-4o-mini model/snapshot")
+        if runner.metadata.get("plan_cache") is not False:
+            p.error("real runner.metadata must confirm plan_cache=False for end-to-end timing")
+    for _ in range(timing["warmup"]):
+        runner.generate(prompts[0][1], seeds[0], Timer(sync))
+        sync()
+
+    comparison = {"model": args.model, "checkpoint": checkpoint, "revision": revision,
+                  "checkpoint_identity": checkpoint_identity,
+                  "generation": s, "scheduler": runner.metadata["scheduler"],
+                  "environment": env, "timing": timing}
+    run_id = uuid.uuid4().hex
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x", encoding="utf-8") as stream:
         for prompt_id, prompt in prompts:
-            for seed in args.seeds:
-                for repeat in range(args.repeats):
-                    metrics = measure(runner, clock, prompt, seed, settings)
-                    if args.condition == "sceneplan":
-                        missing = {"mcp", "hcd"} - metrics["stage_seconds"].keys()
-                        if missing or not metrics["agent_calls"]:
-                            raise RuntimeError(
-                                "ScenePlan runner must time mcp/hcd and count its agent calls; "
-                                f"missing stages: {sorted(missing)}"
-                            )
-                    record = {
-                        "model": args.model, "model_id": model_id, "revision": args.revision,
-                        "condition": args.condition, "runner": args.runner,
-                        "prompt_id": prompt_id, "seed": seed, "repeat": repeat,
-                        "steps": args.steps, "guidance_scale": args.guidance_scale,
-                        "width": width, "height": height,
-                        "device": args.device, "dtype": args.dtype, "hardware": clock.hardware(),
-                        "torch_version": package_version("torch"),
-                        "diffusers_version": package_version("diffusers"),
-                        "model_load_s": load_s,
-                        **metrics,
-                    }
-                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            for seed in seeds:
+                for repeat in range(timing["repeats"]):
+                    timer = Timer(sync)
+                    sync()
+                    torch.cuda.reset_peak_memory_stats(0)
+                    start = time.perf_counter()
+                    error = None
+                    try:
+                        runner.generate(prompt, seed, timer)
+                        sync()
+                        if args.condition == "sceneplan" and (
+                            not {"mcp", "hcd"}.issubset(timer.seconds) or not timer.calls):
+                            raise ValueError("real runner must time mcp/hcd and count API requests")
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {exc}"
+                    elapsed = time.perf_counter() - start
+                    row = {"run_id": run_id, "comparison_id": digest(comparison), **comparison,
+                           "condition": args.condition, "runner": args.runner or "diffusers",
+                           "runner_entry_sha256": hashlib.sha256(runner_entry.read_bytes()).hexdigest(),
+                           "runner_metadata": runner.metadata, "model_load_s": load_s,
+                           "prompt_id": prompt_id, "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                           "seed": seed, "repeat": repeat, "status": "failed" if error else "ok",
+                           "latency_s": None if error else elapsed, "error": error,
+                           "stage_seconds": dict(timer.seconds), "agent_calls": dict(timer.calls),
+                           "gpu_peak_allocated_mib": torch.cuda.max_memory_allocated(0) / 2**20,
+                           "gpu_peak_reserved_mib": torch.cuda.max_memory_reserved(0) / 2**20}
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                     stream.flush()
-                    print(f"{args.model} {args.condition} {prompt_id} seed={seed} "
-                          f"repeat={repeat}: {metrics['latency_s']:.3f}s")
+                    if error:
+                        raise SystemExit(f"stopped; failure saved in {output}: {error}")
+                    print(f"{args.model} {args.condition} {prompt_id} seed={seed}: {elapsed:.3f}s")
 
 
 if __name__ == "__main__":
