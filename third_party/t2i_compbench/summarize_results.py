@@ -16,9 +16,10 @@ from pathlib import Path
 
 
 CONDITIONS = ("direct", "unchecked_plan", "checked_plan")
+SCENEPLAN_CONDITIONS = ("mccd", "joint_repair", "scheduled_fusion", "sceneplan")
 
 
-def read_records(path):
+def read_records(path, conditions=CONDITIONS):
     records = []
     seen = set()
     for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
@@ -35,7 +36,7 @@ def read_records(path):
         missing = required - record.keys()
         if missing:
             raise ValueError(f"line {line_number}: missing {', '.join(sorted(missing))}")
-        if record["condition"] not in CONDITIONS:
+        if record["condition"] not in conditions:
             raise ValueError(f"line {line_number}: unknown condition {record['condition']!r}")
         if (
             not isinstance(record["prompt_id"], (str, int))
@@ -81,19 +82,24 @@ def prompt_means(records):
     return means
 
 
-def check_paired_seeds(records):
+# Pairing：新实验要求每条 prompt 在四种条件下共享十个 seeds。
+def check_paired_seeds(records, conditions=CONDITIONS):
     seeds = defaultdict(lambda: defaultdict(set))
     for record in records:
         seeds[str(record["prompt_id"])][record["condition"]].add(record["seed"])
 
     for prompt_id, by_condition in seeds.items():
-        direct = by_condition.get("direct")
-        if direct is None:
+        baseline = conditions[0]
+        shared_seeds = by_condition.get(baseline)
+        if conditions == SCENEPLAN_CONDITIONS:
+            if set(by_condition) != set(conditions) or len(shared_seeds) != 10:
+                raise ValueError(f"prompt {prompt_id}: need all four conditions and ten seeds")
+        if shared_seeds is None:
             continue
-        for condition in CONDITIONS[1:]:
-            if condition in by_condition and by_condition[condition] != direct:
+        for condition in conditions[1:]:
+            if condition in by_condition and by_condition[condition] != shared_seeds:
                 raise ValueError(
-                    f"prompt {prompt_id}: {condition} and direct must use the same seeds"
+                    f"prompt {prompt_id}: {condition} and {baseline} must use the same seeds"
                 )
 
 
@@ -119,11 +125,12 @@ def bootstrap_ci(differences, rounds, seed):
     return [percentile(samples, 0.025), percentile(samples, 0.975)]
 
 
-def summarize(records, rounds=2000, seed=42):
-    check_paired_seeds(records)
+def summarize(records, rounds=2000, seed=42, conditions=CONDITIONS):
+    check_paired_seeds(records, conditions)
     means = prompt_means(records)
     summary = {}
-    for condition in CONDITIONS:
+    baseline = conditions[0]
+    for condition in conditions:
         prompt_scores = [row[condition] for row in means.values() if condition in row]
         image_rows = [row for row in records if row["condition"] == condition]
         summary[condition] = {
@@ -138,22 +145,21 @@ def summarize(records, rounds=2000, seed=42):
 
     paired = {
         condition: [
-            means[prompt_id][condition] - means[prompt_id]["direct"]
+            means[prompt_id][condition] - means[prompt_id][baseline]
             for prompt_id in means
-            if "direct" in means[prompt_id] and condition in means[prompt_id]
+            if baseline in means[prompt_id] and condition in means[prompt_id]
         ]
-        for condition in CONDITIONS
-        if condition != "direct"
+        for condition in conditions[1:]
     }
     differences = {
         condition: {
             "prompt_count": len(values),
-            "mean_difference_vs_direct": statistics.mean(values) if values else None,
+            f"mean_difference_vs_{baseline}": statistics.mean(values) if values else None,
             "bootstrap_95_ci": bootstrap_ci(values, rounds, seed),
         }
         for condition, values in paired.items()
     }
-    return {"conditions": summary, "paired_differences_vs_direct": differences}
+    return {"conditions": summary, f"paired_differences_vs_{baseline}": differences}
 
 
 def main():
@@ -161,11 +167,15 @@ def main():
     parser.add_argument("input", help="normalized JSONL result file")
     parser.add_argument("--bootstrap-rounds", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--experiment", choices=("pilot", "sceneplan"), default="pilot")
     args = parser.parse_args()
     if args.bootstrap_rounds < 1:
         parser.error("--bootstrap-rounds must be positive")
 
-    result = summarize(read_records(args.input), args.bootstrap_rounds, args.seed)
+    conditions = SCENEPLAN_CONDITIONS if args.experiment == "sceneplan" else CONDITIONS
+    result = summarize(
+        read_records(args.input, conditions), args.bootstrap_rounds, args.seed, conditions
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
