@@ -4,7 +4,7 @@ NLP805 project by Jinjie Wei.
 
 The idea is to check whether a simple scene plan can help a text-to-image model follow spatial relations such as left, right, above, and below.
 
-For the first experiment, I plan to compare the original prompt, a prompt produced from a scene plan, and a prompt produced after checking the scene plan. The first version will use a small subset of T2I-CompBench. Model experiments have not started yet.
+The initial proposal planned to compare direct prompting, unchecked planning, and checked planning on a small subset of T2I-CompBench.
 
 ## Files
 
@@ -25,4 +25,11 @@ python3 scene_plan.py example_plan.json
 python3 split_prompts.py prompts.txt
 ```
 
-The code is an early draft and will change as the project develops.
+## ScenePlan extensions to MCCD
+
+ScenePlan builds on MCCD's multi-agent scene parser and hierarchical compositional diffusion. [MCCD (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/html/Li_MCCD_Multi-Agent_Collaboration-based_Compositional_Diffusion_for_Complex_Text-to-Image_Generation_CVPR_2025_paper.html)
+
+- **Joint layout repair.** Parsed boxes can still violate directional constraints. ScenePlan adjusts their centers together to satisfy feasible constraints with minimal movement.
+- **Spatially scheduled fusion.** MCCD's final blend uses a fixed weight. ScenePlan strengthens regional guidance near related objects early in denoising to improve placement.
+
+Layout checks compare the original, sequentially repaired, and jointly repaired boxes for relation satisfaction and movement. A matched SDXL-base ablation on T2I-CompBench Spatial tests each change alone and both together. The reported score rises from 0.2369 for MCCD to 0.2730 with both changes. [Evaluation setup](third_party/t2i_compbench/README.md#sceneplan-ablation)
